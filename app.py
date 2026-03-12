@@ -63,34 +63,49 @@ def search_ticker(query: str):
 def get_stock_data(ticker: str):
     try:
         stock = yf.Ticker(ticker)
-        info = stock.info or {}
+
+        # Ambil harga historis dulu karena biasanya paling stabil
         hist = stock.history(period="6mo", auto_adjust=False)
 
-        if hist.empty:
-            return None
+        if hist is None or hist.empty:
+            return None, f"{ticker}: history kosong"
 
         close_series = hist["Close"].dropna()
         if close_series.empty:
-            return None
+            return None, f"{ticker}: close series kosong"
 
-        price = info.get("currentPrice")
-        if price is None:
-            price = float(close_series.iloc[-1])
+        price = float(close_series.iloc[-1])
+
+        # fast_info lebih ringan, info dipakai sebagai pelengkap
+        fast_info = {}
+        info = {}
+
+        try:
+            fast_info = stock.fast_info or {}
+        except Exception:
+            fast_info = {}
+
+        try:
+            info = stock.info or {}
+        except Exception:
+            info = {}
 
         eps = info.get("trailingEps")
         pbv = info.get("priceToBook")
+
         roe_raw = info.get("returnOnEquity")
         roe = roe_raw * 100 if roe_raw is not None else None
 
         dividend_yield_raw = info.get("dividendYield")
         dividend_yield = dividend_yield_raw * 100 if dividend_yield_raw is not None else None
 
-        market_cap = info.get("marketCap")
+        market_cap = fast_info.get("market_cap") or info.get("marketCap")
         sector = info.get("sector")
         industry = info.get("industry")
         long_name = info.get("longName") or info.get("shortName") or ticker
 
-        per = (price / eps) if (price is not None and eps is not None and eps > 0) else None
+        # Rasio hanya dihitung bila EPS valid
+        per = (price / eps) if (eps is not None and eps > 0) else None
         fair_value = (eps * 15) if (eps is not None and eps > 0) else None
 
         undervalued = (
@@ -101,7 +116,7 @@ def get_stock_data(ticker: str):
 
         upside_pct = (
             ((fair_value - price) / price) * 100
-            if price is not None and fair_value is not None and price > 0
+            if fair_value is not None and price > 0
             else None
         )
 
@@ -121,9 +136,10 @@ def get_stock_data(ticker: str):
             "undervalued": undervalued,
             "upside_pct": upside_pct,
             "hist": hist
-        }
-    except Exception:
-        return None
+        }, None
+
+    except Exception as e:
+        return None, f"{ticker}: {e}"
 
 # =========================
 # Scoring & Recommendation
@@ -217,13 +233,12 @@ def calculate_score(row: dict, mode: str):
 st.sidebar.title("📊 Stock Screener")
 
 default_tickers = [
-    "BMRI.JK", "PTBA.JK", "BJTM.JK", "SIDO.JK",
-    "BSDE.JK", "ASII.JK", "AALI.JK", "ADRO.JK",
-    "BBRI.JK", "BBCA.JK", "TLKM.JK", "UNVR.JK"
+    "BBCA.JK", "BBRI.JK", "BMRI.JK", "TLKM.JK",
+    "ASII.JK", "PTBA.JK", "SIDO.JK", "ADRO.JK"
 ]
 
 if "saved_tickers" not in st.session_state:
-    st.session_state["saved_tickers"] = ["BBRI.JK", "BBCA.JK", "BMRI.JK", "TLKM.JK"]
+    st.session_state["saved_tickers"] = ["BBCA.JK", "BBRI.JK"]
 
 selected = st.sidebar.multiselect(
     "Pilih ticker umum",
@@ -249,7 +264,8 @@ if manual_input:
     manual_list = [t.strip().upper() for t in manual_input.split(",") if t.strip()]
     selected.extend(manual_list)
 
-tickers = sorted(list(set(selected)))
+# Batasi jumlah ticker agar lebih aman di Streamlit Cloud
+tickers = sorted(list(set(selected)))[:6]
 
 if st.sidebar.button("💾 Simpan Pilihan"):
     st.session_state["saved_tickers"] = tickers
@@ -264,6 +280,8 @@ screen_mode = st.sidebar.selectbox(
 )
 
 show_only_undervalued = st.sidebar.checkbox("Hanya tampilkan undervalued", value=False)
+show_debug = st.sidebar.checkbox("Tampilkan debug", value=False)
+
 min_roe = st.sidebar.slider("Minimum ROE (%)", 0, 30, 10)
 max_per = st.sidebar.slider("Maksimum PER", 0, 40, 20)
 max_pbv = st.sidebar.slider("Maksimum PBV", 0.0, 5.0, 2.0, 0.1)
@@ -274,9 +292,14 @@ min_div_yield = st.sidebar.slider("Minimum Dividend Yield (%)", 0.0, 15.0, 0.0, 
 # =========================
 rows = []
 histories = []
+debug_logs = []
 
 for ticker in tickers:
-    data = get_stock_data(ticker)
+    data, err = get_stock_data(ticker)
+
+    if err:
+        debug_logs.append(err)
+
     if not data:
         continue
 
@@ -320,7 +343,11 @@ st.caption(
 )
 
 if df.empty:
-    st.info("Belum ada data yang berhasil diambil.")
+    st.error("Belum ada data yang berhasil diambil.")
+    if debug_logs:
+        st.write("Debug log:")
+        st.code("\n".join(debug_logs))
+    st.info("Coba kurangi jumlah ticker atau reload lagi beberapa saat.")
     st.stop()
 
 # =========================
@@ -359,6 +386,10 @@ col4.metric("SELL", int((filtered["Recommendation"] == "SELL").sum()))
 avg_upside = filtered["Upside (%)"].dropna().mean() if not filtered["Upside (%)"].dropna().empty else None
 col5.metric("Avg Upside", fmt_pct(avg_upside))
 
+if show_debug and debug_logs:
+    st.subheader("Debug Log")
+    st.code("\n".join(debug_logs))
+
 # =========================
 # Download
 # =========================
@@ -382,55 +413,60 @@ tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Ranking", "Charts", "Detail"])
 with tab1:
     st.subheader("Overview Table")
 
-    overview = filtered.copy()
-    overview["Recommendation"] = overview["Recommendation"].map(recommendation_badge)
-    overview["Undervalued"] = overview["Undervalued"].map(lambda x: "✅" if x else "❌")
+    if filtered.empty:
+        st.warning("Tidak ada saham yang lolos filter.")
+    else:
+        overview = filtered.copy()
+        overview["Recommendation"] = overview["Recommendation"].map(recommendation_badge)
+        overview["Undervalued"] = overview["Undervalued"].map(lambda x: "✅" if x else "❌")
 
-    show_cols = [
-        "Ticker", "Name", "Price", "PER", "PBV", "ROE (%)",
-        "Dividend Yield (%)", "Fair Value", "Upside (%)",
-        "Undervalued", "Recommendation", "Score"
-    ]
+        show_cols = [
+            "Ticker", "Name", "Price", "PER", "PBV", "ROE (%)",
+            "Dividend Yield (%)", "Fair Value", "Upside (%)",
+            "Undervalued", "Recommendation", "Score"
+        ]
 
-    display_overview = overview[show_cols].copy()
-    display_overview["Price"] = display_overview["Price"].apply(lambda x: fmt_num(x, 2))
-    display_overview["PER"] = display_overview["PER"].apply(lambda x: fmt_num(x, 2))
-    display_overview["PBV"] = display_overview["PBV"].apply(lambda x: fmt_num(x, 2))
-    display_overview["ROE (%)"] = display_overview["ROE (%)"].apply(lambda x: fmt_pct(x, 2))
-    display_overview["Dividend Yield (%)"] = display_overview["Dividend Yield (%)"].apply(lambda x: fmt_pct(x, 2))
-    display_overview["Fair Value"] = display_overview["Fair Value"].apply(lambda x: fmt_num(x, 2))
-    display_overview["Upside (%)"] = display_overview["Upside (%)"].apply(lambda x: fmt_pct(x, 2))
-    display_overview["Score"] = display_overview["Score"].apply(lambda x: fmt_num(x, 0))
+        display_overview = overview[show_cols].copy()
+        display_overview["Price"] = display_overview["Price"].apply(lambda x: fmt_num(x, 2))
+        display_overview["PER"] = display_overview["PER"].apply(lambda x: fmt_num(x, 2))
+        display_overview["PBV"] = display_overview["PBV"].apply(lambda x: fmt_num(x, 2))
+        display_overview["ROE (%)"] = display_overview["ROE (%)"].apply(lambda x: fmt_pct(x, 2))
+        display_overview["Dividend Yield (%)"] = display_overview["Dividend Yield (%)"].apply(lambda x: fmt_pct(x, 2))
+        display_overview["Fair Value"] = display_overview["Fair Value"].apply(lambda x: fmt_num(x, 2))
+        display_overview["Upside (%)"] = display_overview["Upside (%)"].apply(lambda x: fmt_pct(x, 2))
+        display_overview["Score"] = display_overview["Score"].apply(lambda x: fmt_num(x, 0))
 
-    st.dataframe(display_overview, use_container_width=True)
+        st.dataframe(display_overview, use_container_width=True)
 
 with tab2:
     st.subheader("Top Ranked Stocks")
 
-    max_top_n = max(3, min(20, len(filtered)))
-    top_default = min(10, len(filtered)) if len(filtered) > 0 else 3
-    top_n = st.slider("Tampilkan Top N", 3, max_top_n, top_default)
-    ranking_df = filtered.head(top_n).copy()
+    if filtered.empty:
+        st.warning("Tidak ada saham yang lolos filter.")
+    else:
+        max_top_n = max(1, min(20, len(filtered)))
+        top_default = min(10, len(filtered))
+        top_n = st.slider("Tampilkan Top N", 1, max_top_n, top_default)
+        ranking_df = filtered.head(top_n).copy()
 
-    st.dataframe(
-        ranking_df[[
-            "Ticker", "Name", "Score", "Recommendation", "Upside (%)",
-            "PER", "PBV", "ROE (%)", "Dividend Yield (%)"
-        ]].assign(
-            **{
-                "Recommendation": lambda x: x["Recommendation"].map(recommendation_badge),
-                "Upside (%)": lambda x: x["Upside (%)"].map(lambda v: fmt_pct(v, 2)),
-                "PER": lambda x: x["PER"].map(lambda v: fmt_num(v, 2)),
-                "PBV": lambda x: x["PBV"].map(lambda v: fmt_num(v, 2)),
-                "ROE (%)": lambda x: x["ROE (%)"].map(lambda v: fmt_pct(v, 2)),
-                "Dividend Yield (%)": lambda x: x["Dividend Yield (%)"].map(lambda v: fmt_pct(v, 2)),
-                "Score": lambda x: x["Score"].map(lambda v: fmt_num(v, 0)),
-            }
-        ),
-        use_container_width=True
-    )
+        st.dataframe(
+            ranking_df[[
+                "Ticker", "Name", "Score", "Recommendation", "Upside (%)",
+                "PER", "PBV", "ROE (%)", "Dividend Yield (%)"
+            ]].assign(
+                **{
+                    "Recommendation": lambda x: x["Recommendation"].map(recommendation_badge),
+                    "Upside (%)": lambda x: x["Upside (%)"].map(lambda v: fmt_pct(v, 2)),
+                    "PER": lambda x: x["PER"].map(lambda v: fmt_num(v, 2)),
+                    "PBV": lambda x: x["PBV"].map(lambda v: fmt_num(v, 2)),
+                    "ROE (%)": lambda x: x["ROE (%)"].map(lambda v: fmt_pct(v, 2)),
+                    "Dividend Yield (%)": lambda x: x["Dividend Yield (%)"].map(lambda v: fmt_pct(v, 2)),
+                    "Score": lambda x: x["Score"].map(lambda v: fmt_num(v, 0)),
+                }
+            ),
+            use_container_width=True
+        )
 
-    if not ranking_df.empty:
         rank_chart = (
             alt.Chart(ranking_df)
             .mark_bar()
@@ -563,6 +599,11 @@ with tab4:
     else:
         st.info("Tidak ada saham yang lolos filter.")
 
+st.markdown("---")
+st.caption(
+    "Catatan: fair value pada aplikasi ini masih memakai pendekatan sederhana: EPS × 15. "
+    "Gunakan untuk screening awal, bukan sebagai satu-satunya dasar keputusan investasi."
+)
 st.markdown("---")
 st.caption(
     "Catatan: fair value pada aplikasi ini masih memakai pendekatan sederhana: EPS × 15. "
