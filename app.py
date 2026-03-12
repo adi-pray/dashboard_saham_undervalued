@@ -31,11 +31,8 @@ def recommendation_badge(rec):
         return "🔴 SELL"
     return "🟡 HOLD"
 
-def screening_badge(mode):
-    return "Value" if mode == "Value Investing" else "Dividend + Value"
-
 # =========================
-# Data Fetching
+# Search ticker
 # =========================
 @st.cache_data(ttl=86400)
 def search_ticker(query: str):
@@ -59,82 +56,55 @@ def search_ticker(query: str):
     except Exception:
         return []
 
+# =========================
+# Batch history (anti rate-limit)
+# =========================
 @st.cache_data(ttl=3600)
-def get_stock_data(ticker: str):
+def get_batch_history(tickers):
     try:
-        stock = yf.Ticker(ticker)
+        if not tickers:
+            return None, "Ticker kosong"
 
-        # Ambil harga historis dulu karena biasanya paling stabil
-        hist = stock.history(period="6mo", auto_adjust=False)
+        data = yf.download(
+            tickers=tickers,
+            period="6mo",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            group_by="ticker",
+            threads=False
+        )
+        return data, None
+    except Exception as e:
+        return None, str(e)
 
-        if hist is None or hist.empty:
+def extract_price_data_from_batch(batch_data, ticker):
+    try:
+        if batch_data is None or batch_data.empty:
+            return None, f"{ticker}: batch data kosong"
+
+        # Multi ticker
+        if isinstance(batch_data.columns, pd.MultiIndex):
+            if ticker not in batch_data.columns.get_level_values(0):
+                return None, f"{ticker}: tidak ada di hasil batch"
+
+            hist = batch_data[ticker].copy().dropna(how="all")
+        else:
+            # Single ticker
+            hist = batch_data.copy().dropna(how="all")
+
+        if hist.empty or "Close" not in hist.columns:
             return None, f"{ticker}: history kosong"
 
         close_series = hist["Close"].dropna()
         if close_series.empty:
-            return None, f"{ticker}: close series kosong"
+            return None, f"{ticker}: close kosong"
 
         price = float(close_series.iloc[-1])
 
-        # fast_info lebih ringan, info dipakai sebagai pelengkap
-        fast_info = {}
-        info = {}
-
-        try:
-            fast_info = stock.fast_info or {}
-        except Exception:
-            fast_info = {}
-
-        try:
-            info = stock.info or {}
-        except Exception:
-            info = {}
-
-        eps = info.get("trailingEps")
-        pbv = info.get("priceToBook")
-
-        roe_raw = info.get("returnOnEquity")
-        roe = roe_raw * 100 if roe_raw is not None else None
-
-        dividend_yield_raw = info.get("dividendYield")
-        dividend_yield = dividend_yield_raw * 100 if dividend_yield_raw is not None else None
-
-        market_cap = fast_info.get("market_cap") or info.get("marketCap")
-        sector = info.get("sector")
-        industry = info.get("industry")
-        long_name = info.get("longName") or info.get("shortName") or ticker
-
-        # Rasio hanya dihitung bila EPS valid
-        per = (price / eps) if (eps is not None and eps > 0) else None
-        fair_value = (eps * 15) if (eps is not None and eps > 0) else None
-
-        undervalued = (
-            price is not None and
-            fair_value is not None and
-            price < fair_value
-        )
-
-        upside_pct = (
-            ((fair_value - price) / price) * 100
-            if fair_value is not None and price > 0
-            else None
-        )
-
         return {
             "ticker": ticker,
-            "name": long_name,
-            "sector": sector,
-            "industry": industry,
             "price": price,
-            "eps": eps,
-            "per": per,
-            "pbv": pbv,
-            "roe": roe,
-            "dividend_yield": dividend_yield,
-            "market_cap": market_cap,
-            "fair_value": fair_value,
-            "undervalued": undervalued,
-            "upside_pct": upside_pct,
             "hist": hist
         }, None
 
@@ -142,71 +112,60 @@ def get_stock_data(ticker: str):
         return None, f"{ticker}: {e}"
 
 # =========================
-# Scoring & Recommendation
+# Optional fundamental detail
+# Only called for 1 ticker in Detail tab
 # =========================
-def classify_recommendation(row: dict):
-    price = row.get("price")
-    fair_value = row.get("fair_value")
-    per = row.get("per")
-    pbv = row.get("pbv")
-    roe = row.get("roe")
-    undervalued = row.get("undervalued")
+@st.cache_data(ttl=3600)
+def get_fundamental_detail(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info or {}
 
-    if (
-        undervalued
-        and per is not None and per < 15
-        and pbv is not None and pbv < 1.5
-        and roe is not None and roe > 10
-    ):
+        eps = info.get("trailingEps")
+        pbv = info.get("priceToBook")
+        roe_raw = info.get("returnOnEquity")
+        roe = roe_raw * 100 if roe_raw is not None else None
+
+        div_raw = info.get("dividendYield")
+        dividend_yield = div_raw * 100 if div_raw is not None else None
+
+        market_cap = info.get("marketCap")
+        sector = info.get("sector")
+        industry = info.get("industry")
+        long_name = info.get("longName") or info.get("shortName") or ticker
+
+        return {
+            "name": long_name,
+            "sector": sector,
+            "industry": industry,
+            "eps": eps,
+            "pbv": pbv,
+            "roe": roe,
+            "dividend_yield": dividend_yield,
+            "market_cap": market_cap,
+        }, None
+    except Exception as e:
+        return None, str(e)
+
+# =========================
+# Scoring sederhana berbasis price momentum + optional valuation
+# =========================
+def classify_recommendation(price, fair_value=None):
+    if fair_value is not None and price < fair_value:
         return "BUY"
-
-    if (
-        per is not None and per > 20
-        and fair_value is not None
-        and price is not None
-        and price > fair_value
-    ):
+    if fair_value is not None and price > fair_value * 1.2:
         return "SELL"
-
     return "HOLD"
 
-def calculate_score(row: dict, mode: str):
+def calculate_score(price_change_pct, upside_pct=None, roe=None, pbv=None, per=None, mode="Price Focus"):
     score = 0
 
-    per = row.get("per")
-    pbv = row.get("pbv")
-    roe = row.get("roe")
-    undervalued = row.get("undervalued")
-    upside_pct = row.get("upside_pct")
-    dividend_yield = row.get("dividend_yield")
-
-    if undervalued:
-        score += 30
-
-    if per is not None:
-        if per < 8:
-            score += 25
-        elif per < 12:
+    if price_change_pct is not None:
+        if price_change_pct > 20:
+            score += 30
+        elif price_change_pct > 10:
             score += 20
-        elif per < 15:
-            score += 12
-        elif per < 20:
-            score += 5
-
-    if pbv is not None:
-        if pbv < 1:
-            score += 20
-        elif pbv < 1.5:
-            score += 12
-        elif pbv < 2:
-            score += 5
-
-    if roe is not None:
-        if roe > 20:
-            score += 25
-        elif roe > 15:
-            score += 18
-        elif roe > 10:
+        elif price_change_pct > 0:
             score += 10
 
     if upside_pct is not None:
@@ -217,13 +176,29 @@ def calculate_score(row: dict, mode: str):
         elif upside_pct > 15:
             score += 8
 
-    if mode == "Dividend + Value" and dividend_yield is not None:
-        if dividend_yield > 8:
+    if roe is not None:
+        if roe > 20:
             score += 20
-        elif dividend_yield > 5:
+        elif roe > 15:
             score += 14
-        elif dividend_yield > 3:
+        elif roe > 10:
             score += 8
+
+    if pbv is not None:
+        if pbv < 1:
+            score += 15
+        elif pbv < 1.5:
+            score += 10
+        elif pbv < 2:
+            score += 5
+
+    if per is not None:
+        if per < 8:
+            score += 15
+        elif per < 12:
+            score += 10
+        elif per < 15:
+            score += 5
 
     return score
 
@@ -234,11 +209,11 @@ st.sidebar.title("📊 Stock Screener")
 
 default_tickers = [
     "BBCA.JK", "BBRI.JK", "BMRI.JK", "TLKM.JK",
-    "ASII.JK", "PTBA.JK", "SIDO.JK", "ADRO.JK"
+    "ASII.JK", "PTBA.JK", "ADRO.JK", "SIDO.JK"
 ]
 
 if "saved_tickers" not in st.session_state:
-    st.session_state["saved_tickers"] = ["BBCA.JK", "BBRI.JK"]
+    st.session_state["saved_tickers"] = ["BBCA.JK", "BBRI.JK", "BMRI.JK"]
 
 selected = st.sidebar.multiselect(
     "Pilih ticker umum",
@@ -264,127 +239,96 @@ if manual_input:
     manual_list = [t.strip().upper() for t in manual_input.split(",") if t.strip()]
     selected.extend(manual_list)
 
-# Batasi jumlah ticker agar lebih aman di Streamlit Cloud
-tickers = sorted(list(set(selected)))[:6]
+# Penting: batasi jumlah ticker untuk hindari rate limit
+tickers = sorted(list(set(selected)))[:5]
 
 if st.sidebar.button("💾 Simpan Pilihan"):
     st.session_state["saved_tickers"] = tickers
     st.sidebar.success("Pilihan disimpan.")
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Screening")
-
-screen_mode = st.sidebar.selectbox(
-    "Mode Screening",
-    ["Value Investing", "Dividend + Value"]
-)
-
-show_only_undervalued = st.sidebar.checkbox("Hanya tampilkan undervalued", value=False)
 show_debug = st.sidebar.checkbox("Tampilkan debug", value=False)
 
-min_roe = st.sidebar.slider("Minimum ROE (%)", 0, 30, 10)
-max_per = st.sidebar.slider("Maksimum PER", 0, 40, 20)
-max_pbv = st.sidebar.slider("Maksimum PBV", 0.0, 5.0, 2.0, 0.1)
-min_div_yield = st.sidebar.slider("Minimum Dividend Yield (%)", 0.0, 15.0, 0.0, 0.5)
+# =========================
+# Load batch price data
+# =========================
+batch_data, batch_err = get_batch_history(tickers)
 
-# =========================
-# Build Dataset
-# =========================
 rows = []
 histories = []
 debug_logs = []
 
+if batch_err:
+    debug_logs.append(f"Batch error: {batch_err}")
+
 for ticker in tickers:
-    data, err = get_stock_data(ticker)
+    data, err = extract_price_data_from_batch(batch_data, ticker)
 
     if err:
         debug_logs.append(err)
-
-    if not data:
         continue
 
-    recommendation = classify_recommendation(data)
-    score = calculate_score(data, screen_mode)
+    hist = data["hist"].copy()
+    close_series = hist["Close"].dropna()
+
+    first_price = float(close_series.iloc[0]) if not close_series.empty else None
+    last_price = float(close_series.iloc[-1]) if not close_series.empty else None
+
+    price_change_pct = (
+        ((last_price - first_price) / first_price) * 100
+        if first_price is not None and first_price > 0 and last_price is not None
+        else None
+    )
 
     row = {
-        "Ticker": data["ticker"],
-        "Name": data["name"],
-        "Sector": data["sector"],
-        "Industry": data["industry"],
-        "Price": data["price"],
-        "EPS": data["eps"],
-        "PER": data["per"],
-        "PBV": data["pbv"],
-        "ROE (%)": data["roe"],
-        "Dividend Yield (%)": data["dividend_yield"],
-        "Fair Value": data["fair_value"],
-        "Upside (%)": data["upside_pct"],
-        "Undervalued": data["undervalued"],
-        "Recommendation": recommendation,
-        "Score": score,
-        "Market Cap": data["market_cap"],
+        "Ticker": ticker,
+        "Name": ticker,
+        "Price": last_price,
+        "6M Change (%)": price_change_pct,
+        "EPS": None,
+        "PER": None,
+        "PBV": None,
+        "ROE (%)": None,
+        "Dividend Yield (%)": None,
+        "Fair Value": None,
+        "Upside (%)": None,
+        "Recommendation": "HOLD",
+        "Score": calculate_score(price_change_pct),
+        "Sector": None,
+        "Industry": None,
+        "Market Cap": None
     }
     rows.append(row)
 
-    hist = data["hist"].copy().reset_index()
-    if not hist.empty:
-        base = hist["Close"].iloc[0]
+    hist_reset = hist.reset_index()
+    if not hist_reset.empty and "Close" in hist_reset.columns:
+        base = hist_reset["Close"].iloc[0]
         if pd.notna(base) and base != 0:
-            hist["Indexed"] = (hist["Close"] / base) * 100
-            hist["Ticker"] = ticker
-            histories.append(hist[["Date", "Ticker", "Close", "Indexed"]])
+            hist_reset["Indexed"] = (hist_reset["Close"] / base) * 100
+            hist_reset["Ticker"] = ticker
+            histories.append(hist_reset[["Date", "Ticker", "Close", "Indexed"]])
 
 df = pd.DataFrame(rows)
 
+# =========================
+# Header
+# =========================
 st.title("📈 Professional Stock Screener")
-st.caption(
-    f"Updated from Yahoo Finance | Screening: {screening_badge(screen_mode)} | "
-    f"Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-)
+st.caption(f"Updated from Yahoo Finance batch download | Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 if df.empty:
-    st.error("Belum ada data yang berhasil diambil.")
+    st.error("Belum ada data harga yang berhasil diambil.")
     if debug_logs:
-        st.write("Debug log:")
         st.code("\n".join(debug_logs))
-    st.info("Coba kurangi jumlah ticker atau reload lagi beberapa saat.")
+    st.info("Coba kurangi ticker menjadi 1-3 atau reload beberapa menit lagi.")
     st.stop()
 
-# =========================
-# Filters
-# =========================
-filtered = df.copy()
-
-filtered = filtered[
-    ((filtered["ROE (%)"].isna()) | (filtered["ROE (%)"] >= min_roe)) &
-    ((filtered["PER"].isna()) | (filtered["PER"] <= max_per)) &
-    ((filtered["PBV"].isna()) | (filtered["PBV"] <= max_pbv))
-]
-
-if screen_mode == "Dividend + Value":
-    filtered = filtered[
-        (filtered["Dividend Yield (%)"].isna()) | (filtered["Dividend Yield (%)"] >= min_div_yield)
-    ]
-
-if show_only_undervalued:
-    filtered = filtered[filtered["Undervalued"] == True]
-
-filtered = filtered.sort_values(
-    by=["Score", "Upside (%)"],
-    ascending=[False, False],
-    na_position="last"
-).reset_index(drop=True)
-
-# =========================
-# Top Metrics
-# =========================
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("Stocks", len(filtered))
-col2.metric("BUY", int((filtered["Recommendation"] == "BUY").sum()))
-col3.metric("HOLD", int((filtered["Recommendation"] == "HOLD").sum()))
-col4.metric("SELL", int((filtered["Recommendation"] == "SELL").sum()))
-avg_upside = filtered["Upside (%)"].dropna().mean() if not filtered["Upside (%)"].dropna().empty else None
-col5.metric("Avg Upside", fmt_pct(avg_upside))
+col1, col2, col3 = st.columns(3)
+col1.metric("Stocks", len(df))
+avg_price_change = df["6M Change (%)"].dropna().mean() if not df["6M Change (%)"].dropna().empty else None
+col2.metric("Avg 6M Change", fmt_pct(avg_price_change))
+best_score = df["Score"].max() if not df.empty else None
+col3.metric("Best Score", fmt_num(best_score, 0))
 
 if show_debug and debug_logs:
     st.subheader("Debug Log")
@@ -393,15 +337,14 @@ if show_debug and debug_logs:
 # =========================
 # Download
 # =========================
-download_df = filtered.copy()
-download_df["Undervalued"] = download_df["Undervalued"].map(lambda x: "Yes" if x else "No")
+download_df = df.copy()
 download_df["Recommendation"] = download_df["Recommendation"].map(recommendation_badge)
-
 csv_data = download_df.to_csv(index=False).encode("utf-8")
+
 st.download_button(
     label="⬇️ Download CSV",
     data=csv_data,
-    file_name="professional_stock_screener.csv",
+    file_name="stock_screener_batch.csv",
     mime="text/csv"
 )
 
@@ -411,201 +354,197 @@ st.download_button(
 tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Ranking", "Charts", "Detail"])
 
 with tab1:
-    st.subheader("Overview Table")
+    st.subheader("Overview")
 
-    if filtered.empty:
-        st.warning("Tidak ada saham yang lolos filter.")
-    else:
-        overview = filtered.copy()
-        overview["Recommendation"] = overview["Recommendation"].map(recommendation_badge)
-        overview["Undervalued"] = overview["Undervalued"].map(lambda x: "✅" if x else "❌")
+    overview = df.copy()
+    overview["Recommendation"] = overview["Recommendation"].map(recommendation_badge)
 
-        show_cols = [
-            "Ticker", "Name", "Price", "PER", "PBV", "ROE (%)",
-            "Dividend Yield (%)", "Fair Value", "Upside (%)",
-            "Undervalued", "Recommendation", "Score"
-        ]
+    display_overview = overview[[
+        "Ticker", "Name", "Price", "6M Change (%)", "Recommendation", "Score"
+    ]].copy()
 
-        display_overview = overview[show_cols].copy()
-        display_overview["Price"] = display_overview["Price"].apply(lambda x: fmt_num(x, 2))
-        display_overview["PER"] = display_overview["PER"].apply(lambda x: fmt_num(x, 2))
-        display_overview["PBV"] = display_overview["PBV"].apply(lambda x: fmt_num(x, 2))
-        display_overview["ROE (%)"] = display_overview["ROE (%)"].apply(lambda x: fmt_pct(x, 2))
-        display_overview["Dividend Yield (%)"] = display_overview["Dividend Yield (%)"].apply(lambda x: fmt_pct(x, 2))
-        display_overview["Fair Value"] = display_overview["Fair Value"].apply(lambda x: fmt_num(x, 2))
-        display_overview["Upside (%)"] = display_overview["Upside (%)"].apply(lambda x: fmt_pct(x, 2))
-        display_overview["Score"] = display_overview["Score"].apply(lambda x: fmt_num(x, 0))
+    display_overview["Price"] = display_overview["Price"].apply(lambda x: fmt_num(x, 2))
+    display_overview["6M Change (%)"] = display_overview["6M Change (%)"].apply(lambda x: fmt_pct(x, 2))
+    display_overview["Score"] = display_overview["Score"].apply(lambda x: fmt_num(x, 0))
 
-        st.dataframe(display_overview, use_container_width=True)
+    st.dataframe(display_overview, use_container_width=True)
 
 with tab2:
-    st.subheader("Top Ranked Stocks")
+    st.subheader("Ranking")
 
-    if filtered.empty:
-        st.warning("Tidak ada saham yang lolos filter.")
-    else:
-        max_top_n = max(1, min(20, len(filtered)))
-        top_default = min(10, len(filtered))
-        top_n = st.slider("Tampilkan Top N", 1, max_top_n, top_default)
-        ranking_df = filtered.head(top_n).copy()
+    ranking_df = df.sort_values(
+        by=["Score", "6M Change (%)"],
+        ascending=[False, False],
+        na_position="last"
+    ).reset_index(drop=True)
 
-        st.dataframe(
-            ranking_df[[
-                "Ticker", "Name", "Score", "Recommendation", "Upside (%)",
-                "PER", "PBV", "ROE (%)", "Dividend Yield (%)"
-            ]].assign(
-                **{
-                    "Recommendation": lambda x: x["Recommendation"].map(recommendation_badge),
-                    "Upside (%)": lambda x: x["Upside (%)"].map(lambda v: fmt_pct(v, 2)),
-                    "PER": lambda x: x["PER"].map(lambda v: fmt_num(v, 2)),
-                    "PBV": lambda x: x["PBV"].map(lambda v: fmt_num(v, 2)),
-                    "ROE (%)": lambda x: x["ROE (%)"].map(lambda v: fmt_pct(v, 2)),
-                    "Dividend Yield (%)": lambda x: x["Dividend Yield (%)"].map(lambda v: fmt_pct(v, 2)),
-                    "Score": lambda x: x["Score"].map(lambda v: fmt_num(v, 0)),
-                }
-            ),
-            use_container_width=True
+    top_n = st.slider("Tampilkan Top N", 1, len(ranking_df), min(5, len(ranking_df)))
+
+    ranking_show = ranking_df.head(top_n).copy()
+    ranking_show["Recommendation"] = ranking_show["Recommendation"].map(recommendation_badge)
+
+    display_ranking = ranking_show[[
+        "Ticker", "Name", "Price", "6M Change (%)", "Recommendation", "Score"
+    ]].copy()
+
+    display_ranking["Price"] = display_ranking["Price"].apply(lambda x: fmt_num(x, 2))
+    display_ranking["6M Change (%)"] = display_ranking["6M Change (%)"].apply(lambda x: fmt_pct(x, 2))
+    display_ranking["Score"] = display_ranking["Score"].apply(lambda x: fmt_num(x, 0))
+
+    st.dataframe(display_ranking, use_container_width=True)
+
+    rank_chart = (
+        alt.Chart(ranking_show)
+        .mark_bar()
+        .encode(
+            x=alt.X("Score:Q", title="Score"),
+            y=alt.Y("Ticker:N", sort="-x", title="Ticker"),
+            tooltip=[
+                "Ticker",
+                alt.Tooltip("Price:Q", format=".2f"),
+                alt.Tooltip("6M Change (%):Q", format=".2f"),
+                alt.Tooltip("Score:Q", format=".0f"),
+            ]
         )
-
-        rank_chart = (
-            alt.Chart(ranking_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("Score:Q", title="Score"),
-                y=alt.Y("Ticker:N", sort="-x", title="Ticker"),
-                tooltip=[
-                    "Ticker", "Name",
-                    alt.Tooltip("Score:Q", format=".0f"),
-                    alt.Tooltip("Upside (%):Q", format=".2f"),
-                    alt.Tooltip("ROE (%):Q", format=".2f"),
-                    alt.Tooltip("Dividend Yield (%):Q", format=".2f"),
-                ]
-            )
-            .properties(height=420)
-        )
-        st.altair_chart(rank_chart, use_container_width=True)
+        .properties(height=400)
+    )
+    st.altair_chart(rank_chart, use_container_width=True)
 
 with tab3:
-    st.subheader("Performance Comparison")
+    st.subheader("Charts")
 
-    visible_tickers = filtered["Ticker"].tolist()
-    if histories and visible_tickers:
+    if histories:
         all_hist = pd.concat(histories, ignore_index=True)
-        all_hist = all_hist[all_hist["Ticker"].isin(visible_tickers)]
 
-        if not all_hist.empty:
-            chart_compare = (
-                alt.Chart(all_hist)
-                .mark_line()
-                .encode(
-                    x=alt.X("Date:T", title="Date"),
-                    y=alt.Y("Indexed:Q", title="Indexed Performance (Base 100)"),
-                    color=alt.Color("Ticker:N"),
-                    tooltip=[
-                        "Ticker:N",
-                        "Date:T",
-                        alt.Tooltip("Indexed:Q", format=".2f"),
-                        alt.Tooltip("Close:Q", format=".2f"),
-                    ]
-                )
-                .properties(height=450)
-                .interactive()
-            )
-            st.altair_chart(chart_compare, use_container_width=True)
-        else:
-            st.info("Belum ada data historis untuk comparison chart.")
-    else:
-        st.info("Belum ada data historis untuk comparison chart.")
-
-    st.subheader("Valuation Scatter")
-
-    scatter_source = filtered.dropna(subset=["PER", "ROE (%)"]).copy()
-    if not scatter_source.empty:
-        scatter = (
-            alt.Chart(scatter_source)
-            .mark_circle(size=140)
+        comparison_chart = (
+            alt.Chart(all_hist)
+            .mark_line()
             .encode(
-                x=alt.X("PER:Q", title="PER"),
-                y=alt.Y("ROE (%):Q", title="ROE (%)"),
-                size=alt.Size("Upside (%):Q", title="Upside (%)"),
-                color=alt.Color("Recommendation:N"),
+                x=alt.X("Date:T", title="Date"),
+                y=alt.Y("Indexed:Q", title="Indexed Performance (Base 100)"),
+                color=alt.Color("Ticker:N"),
                 tooltip=[
-                    "Ticker", "Name",
-                    alt.Tooltip("PER:Q", format=".2f"),
-                    alt.Tooltip("PBV:Q", format=".2f"),
-                    alt.Tooltip("ROE (%):Q", format=".2f"),
-                    alt.Tooltip("Upside (%):Q", format=".2f"),
-                    alt.Tooltip("Dividend Yield (%):Q", format=".2f"),
+                    "Ticker:N",
+                    "Date:T",
+                    alt.Tooltip("Indexed:Q", format=".2f"),
+                    alt.Tooltip("Close:Q", format=".2f"),
                 ]
             )
             .properties(height=450)
             .interactive()
         )
+        st.altair_chart(comparison_chart, use_container_width=True)
+
+        st.subheader("Momentum Scatter")
+
+        scatter_source = df.dropna(subset=["6M Change (%)"]).copy()
+        scatter = (
+            alt.Chart(scatter_source)
+            .mark_circle(size=160)
+            .encode(
+                x=alt.X("Price:Q", title="Price"),
+                y=alt.Y("6M Change (%):Q", title="6M Change (%)"),
+                size=alt.Size("Score:Q", title="Score"),
+                color=alt.Color("Ticker:N"),
+                tooltip=[
+                    "Ticker",
+                    alt.Tooltip("Price:Q", format=".2f"),
+                    alt.Tooltip("6M Change (%):Q", format=".2f"),
+                    alt.Tooltip("Score:Q", format=".0f"),
+                ]
+            )
+            .properties(height=420)
+            .interactive()
+        )
         st.altair_chart(scatter, use_container_width=True)
     else:
-        st.info("Data PER/ROE belum cukup untuk scatter chart.")
+        st.info("Belum ada data chart yang bisa ditampilkan.")
 
 with tab4:
-    st.subheader("Stock Detail")
+    st.subheader("Detail")
 
-    detail_options = filtered["Ticker"].tolist()
-    if detail_options:
-        selected_detail = st.selectbox("Pilih saham", detail_options)
-        detail_row = filtered[filtered["Ticker"] == selected_detail].iloc[0]
+    detail_options = df["Ticker"].tolist()
+    selected_detail = st.selectbox("Pilih saham", detail_options)
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Price", fmt_num(detail_row["Price"], 2))
-        c2.metric("Fair Value", fmt_num(detail_row["Fair Value"], 2))
-        c3.metric("Upside", fmt_pct(detail_row["Upside (%)"], 2))
-        c4.metric("Recommendation", recommendation_badge(detail_row["Recommendation"]))
+    detail_row = df[df["Ticker"] == selected_detail].iloc[0]
 
-        c5, c6, c7, c8 = st.columns(4)
-        c5.metric("PER", fmt_num(detail_row["PER"], 2))
-        c6.metric("PBV", fmt_num(detail_row["PBV"], 2))
-        c7.metric("ROE", fmt_pct(detail_row["ROE (%)"], 2))
-        c8.metric("Dividend Yield", fmt_pct(detail_row["Dividend Yield (%)"], 2))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Price", fmt_num(detail_row["Price"], 2))
+    c2.metric("6M Change", fmt_pct(detail_row["6M Change (%)"], 2))
+    c3.metric("Score", fmt_num(detail_row["Score"], 0))
 
-        st.markdown("### Company Profile")
-        st.write(f"**Name:** {detail_row['Name']}")
-        st.write(f"**Sector:** {detail_row['Sector'] or '-'}")
-        st.write(f"**Industry:** {detail_row['Industry'] or '-'}")
-        st.write(f"**Market Cap:** {fmt_num(detail_row['Market Cap'], 0)}")
-        st.write(f"**Undervalued:** {'Yes' if detail_row['Undervalued'] else 'No'}")
-        st.write(f"**Score:** {fmt_num(detail_row['Score'], 0)}")
+    st.markdown("### Fundamental Detail")
+    st.caption("Fundamental diambil hanya untuk 1 ticker agar lebih aman dari rate limit.")
 
-        selected_hist = None
-        for h in histories:
-            if not h.empty and h["Ticker"].iloc[0] == selected_detail:
-                selected_hist = h.copy()
-                break
+    fund, fund_err = get_fundamental_detail(selected_detail)
 
-        if selected_hist is not None and not selected_hist.empty:
-            st.markdown("### Historical Price")
-            detail_chart = (
-                alt.Chart(selected_hist)
-                .mark_line()
-                .encode(
-                    x=alt.X("Date:T", title="Date"),
-                    y=alt.Y("Close:Q", title="Close Price"),
-                    tooltip=[
-                        "Date:T",
-                        alt.Tooltip("Close:Q", format=".2f")
-                    ]
-                )
-                .properties(height=400)
-                .interactive()
+    if fund_err:
+        st.warning(f"Fundamental belum tersedia: {fund_err}")
+    elif fund:
+        eps = fund.get("eps")
+        pbv = fund.get("pbv")
+        roe = fund.get("roe")
+        div_yield = fund.get("dividend_yield")
+        market_cap = fund.get("market_cap")
+        sector = fund.get("sector")
+        industry = fund.get("industry")
+        long_name = fund.get("name")
+
+        price = detail_row["Price"]
+        per = (price / eps) if (eps is not None and eps > 0 and price is not None) else None
+        fair_value = (eps * 15) if (eps is not None and eps > 0) else None
+        upside_pct = (
+            ((fair_value - price) / price) * 100
+            if fair_value is not None and price is not None and price > 0
+            else None
+        )
+        recommendation = classify_recommendation(price, fair_value)
+
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("PER", fmt_num(per, 2))
+        d2.metric("PBV", fmt_num(pbv, 2))
+        d3.metric("ROE", fmt_pct(roe, 2))
+        d4.metric("Dividend Yield", fmt_pct(div_yield, 2))
+
+        d5, d6, d7 = st.columns(3)
+        d5.metric("Fair Value", fmt_num(fair_value, 2))
+        d6.metric("Upside", fmt_pct(upside_pct, 2))
+        d7.metric("Recommendation", recommendation_badge(recommendation))
+
+        st.write(f"**Name:** {long_name}")
+        st.write(f"**Sector:** {sector or '-'}")
+        st.write(f"**Industry:** {industry or '-'}")
+        st.write(f"**Market Cap:** {fmt_num(market_cap, 0)}")
+
+    st.markdown("### Historical Price")
+
+    selected_hist = None
+    for h in histories:
+        if not h.empty and h["Ticker"].iloc[0] == selected_detail:
+            selected_hist = h.copy()
+            break
+
+    if selected_hist is not None and not selected_hist.empty:
+        detail_chart = (
+            alt.Chart(selected_hist)
+            .mark_line()
+            .encode(
+                x=alt.X("Date:T", title="Date"),
+                y=alt.Y("Close:Q", title="Close Price"),
+                tooltip=[
+                    "Date:T",
+                    alt.Tooltip("Close:Q", format=".2f")
+                ]
             )
-            st.altair_chart(detail_chart, use_container_width=True)
+            .properties(height=400)
+            .interactive()
+        )
+        st.altair_chart(detail_chart, use_container_width=True)
     else:
-        st.info("Tidak ada saham yang lolos filter.")
+        st.info("Data historis tidak tersedia.")
 
 st.markdown("---")
 st.caption(
-    "Catatan: fair value pada aplikasi ini masih memakai pendekatan sederhana: EPS × 15. "
-    "Gunakan untuk screening awal, bukan sebagai satu-satunya dasar keputusan investasi."
-)
-st.markdown("---")
-st.caption(
-    "Catatan: fair value pada aplikasi ini masih memakai pendekatan sederhana: EPS × 15. "
-    "Gunakan untuk screening awal, bukan sebagai satu-satunya dasar keputusan investasi."
+    "Versi ini dioptimalkan untuk mengurangi rate limit Yahoo Finance dengan batch download harga. "
+    "Fundamental hanya diambil saat membuka detail 1 ticker."
 )
